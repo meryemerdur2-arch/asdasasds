@@ -1,0 +1,116 @@
+name: RDP (Linux)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: ubuntu-latest
+    # Free plan için aylık kota sınırını göz önünde bulundurarak ayarlayın.
+    # Örnek: Free plan aylık 2000 dakika ~ 33 saat olduğu için burada 2000 kullandım.
+    timeout-minutes: 2000
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update & install xrdp and desktop
+        run: |
+          set -e
+          sudo apt-get update
+          # xfce4 hafif bir masaüstü; isteğe bağlı olarak azaltabilirsiniz
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp xfce4 xfce4-goodies dbus-x11 x11-xserver-utils
+
+      - name: Configure runneradmin for RDP
+        run: |
+          set -e
+          username="runneradmin"
+          # Tercihen secrets.RDP_PASSWORD kullanın. Yoksa rastgele oluşturulur ve GITHUB_ENV'e yazılır.
+          if [ -n "${{ secrets.RDP_PASSWORD }}" ]; then
+            password="${{ secrets.RDP_PASSWORD }}"
+          else
+            password=$(openssl rand -base64 12)
+          fi
+
+          # Kullanıcıyı oluştur (varsa hata vermez)
+          if ! id -u "$username" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "$username"
+          fi
+
+          echo "$username:$password" | sudo chpasswd
+          sudo usermod -aG sudo "$username"
+
+          # xfce oturumunu kullanması için .xsession ayarı
+          echo "startxfce4" | sudo tee /home/$username/.xsession >/dev/null
+          sudo chown $username:$username /home/$username/.xsession
+
+          # xrdp servisini etkinleştir ve başlat
+          sudo systemctl enable --now xrdp
+
+          echo "RDP_USER=$username" >> $GITHUB_ENV
+          echo "RDP_PASS=$password" >> $GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          set -e
+          # Tailscale kurulum scripti
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Establish Tailscale Connection
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -e
+          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
+            echo "Error: TAILSCALE_AUTH_KEY secret is not set."
+            exit 1
+          fi
+
+          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="gh-runner-${{ github.run_id }}"
+
+          tsIP=""
+          retries=0
+          while [ -z "$tsIP" ] && [ $retries -lt 10 ]; do
+            tsIP=$(tailscale ip -4 | tr -d '\r')
+            if [ -n "$tsIP" ]; then break; fi
+            sleep 5
+            retries=$((retries+1))
+          done
+
+          if [ -z "$tsIP" ]; then
+            echo "Tailscale IP not assigned. Exiting."
+            exit 1
+          fi
+
+          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          set -e
+          echo "Tailscale IP: $TAILSCALE_IP"
+          # netcat ile 3389 test (nc paket yüklü değilse apt-get ile ekleyin)
+          if ! command -v nc >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y netcat
+          fi
+
+          if ! nc -z -w5 "$TAILSCALE_IP" 3389; then
+            echo "TCP connection to RDP port 3389 failed"
+            exit 1
+          fi
+          echo "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          echo ""
+          echo "=== RDP ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: $RDP_USER"
+          echo "Password: $RDP_PASS"
+          echo "=================="
+          echo ""
+          # Bağlantıyı açık tutmak için basit döngü (Ctrl+C ile workflow'u sonlandırabilirsiniz)
+          while true; do
+            echo "[$(date)] RDP Active - use Cancel workflow to terminate"
+            sleep 300
+          done
